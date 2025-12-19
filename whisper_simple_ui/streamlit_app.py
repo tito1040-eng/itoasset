@@ -6,8 +6,10 @@ import subprocess
 import time
 import csv
 import io
+import threading
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     from dotenv import load_dotenv
@@ -28,6 +30,7 @@ try:
     MASKER_AVAILABLE = True
 except ImportError:
     MASKER_AVAILABLE = False
+    _MASK_TOKENS = None
 
 # 定数
 DEFAULT_MODEL = "whisper-1"
@@ -35,7 +38,7 @@ SUPPORTED_EXTENSIONS = {
     ".mp3", ".wav", ".m4a", ".mp4", ".avi", ".mov", ".mkv", ".flv", ".webm", ".ogg", ".aac", ".flac", ".mpeg", ".mpga"
 }
 
-# --- ヘルパー関数 (web_ui.py から移植・調整) ---
+# --- ヘルパー関数 ---
 
 def _get_ffmpeg_path() -> Optional[str]:
     try:
@@ -52,6 +55,8 @@ def _compress_audio(input_path: Path) -> Path:
     """
     ffmpegを使用して音声を圧縮する (16kHz, mono, 32kbps MP3).
     """
+    # 拡張子を.mp3にした一時ファイルを作成
+    # delete=False にして、パスを取得した後にクローズし、ffmpegに渡す
     tf = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
     tf.close()
     output_path = Path(tf.name)
@@ -71,11 +76,82 @@ def _compress_audio(input_path: Path) -> Path:
         str(output_path)
     ]
     
-    # ストリームリット上で実行するため、エラー出力をキャプチャして例外に含めるなどの配慮も可能だが
-    # ここではシンプルに実装
+    # ffmpeg実行
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     
     return output_path
+
+def process_single_file(
+    file_path: Path,
+    original_name: str,
+    api_key: str,
+    language: Optional[str],
+    enable_mask: bool
+) -> Dict[str, Any]:
+    """
+    1つのファイルを処理するワーカー関数
+    """
+    client = OpenAI(api_key=api_key)
+    
+    result_data = {
+        "file": original_name,
+        "success": False,
+        "text": "",
+        "text_masked": "",
+        "error": "",
+        "model": DEFAULT_MODEL,
+        "process_time_sec": 0
+    }
+    
+    start_time = time.time()
+    compressed_path = None
+    target_path = file_path
+    
+    try:
+        # サイズチェック & 圧縮
+        try:
+            file_size = file_path.stat().st_size
+        except Exception:
+            file_size = 0
+
+        # 25MB (approx 26,214,400 bytes)
+        if file_size > 25 * 1024 * 1024:
+            # 圧縮試行
+            try:
+                compressed_path = _compress_audio(file_path)
+                target_path = compressed_path
+            except Exception as e:
+                raise ValueError(f"25MB超過ファイルの圧縮に失敗しました: {e}")
+
+        # APIコール
+        with open(target_path, "rb") as audio_file:
+            params = {"model": DEFAULT_MODEL, "file": audio_file}
+            if language and language.strip():
+                params["language"] = language.strip()
+            
+            resp = client.audio.transcriptions.create(**params)
+        
+        raw_text = getattr(resp, "text", "")
+        masked_text = raw_text
+        if enable_mask and MASKER_AVAILABLE and _MASK_TOKENS:
+            masked_text = mask_text(raw_text, _MASK_TOKENS)
+        
+        result_data["success"] = True
+        result_data["text"] = raw_text
+        result_data["text_masked"] = masked_text
+        
+    except Exception as e:
+        result_data["error"] = str(e)
+    finally:
+        result_data["process_time_sec"] = time.time() - start_time
+        # 圧縮ファイルの削除
+        if compressed_path and compressed_path.exists():
+            try:
+                compressed_path.unlink()
+            except:
+                pass
+                
+    return result_data
 
 # --- UI ---
 
@@ -98,12 +174,16 @@ with st.sidebar:
     # 言語設定
     language = st.text_input("言語コード (例: ja, en)", value="", help="空欄の場合は自動検出")
     
+    # ワーカー数
+    workers = st.number_input("並列処理数 (Workers)", min_value=1, max_value=10, value=4)
+
     # マスク設定
     enable_mask = False
     if MASKER_AVAILABLE:
         enable_mask = st.checkbox("個人情報マスクを有効化", value=False)
     else:
         st.caption("masker.py が見つからないため、マスク機能は無効です。")
+        st.caption("requirements.txtの依存関係を確認してください。")
 
 # メインエリア
 uploaded_files = st.file_uploader(
@@ -114,89 +194,74 @@ uploaded_files = st.file_uploader(
 
 if uploaded_files and api_key_input:
     if st.button("文字起こし開始"):
-        client = OpenAI(api_key=api_key_input)
-        
-        results = []
+        # プログレスバーなどのUI要素準備
         progress_bar = st.progress(0)
         status_text = st.empty()
         
+        results = []
         total_files = len(uploaded_files)
         
-        # 一時ディレクトリで作業
+        # 一時ディレクトリを作成して処理
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path_dir = Path(temp_dir)
+            status_text.text("ファイルを準備中...")
             
-            for idx, uploaded_file in enumerate(uploaded_files):
-                file_name = uploaded_file.name
-                status_text.text(f"処理中 ({idx+1}/{total_files}): {file_name}")
-                
-                # ファイルを保存
-                file_path = temp_path_dir / file_name
+            # 1. まず全てのファイルを一時ディレクトリに保存する (並列処理のためにファイル実体が必要)
+            file_paths = []
+            for uploaded_file in uploaded_files:
+                file_path = temp_path_dir / uploaded_file.name
                 with open(file_path, "wb") as f:
                     f.write(uploaded_file.getbuffer())
-                
-                result_data = {
-                    "file": file_name,
-                    "success": False,
-                    "text": "",
-                    "text_masked": "",
-                    "error": "",
-                    "model": DEFAULT_MODEL,
-                    "process_time_sec": 0
+                file_paths.append((file_path, uploaded_file.name))
+            
+            # 2. 並列処理実行
+            completed_count = 0
+            status_text.text(f"処理中 (0/{total_files})... 並列数: {workers}")
+            
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                # タスクのサブミット
+                future_to_file = {
+                    executor.submit(
+                        process_single_file, 
+                        path, 
+                        name, 
+                        api_key_input, 
+                        language, 
+                        enable_mask
+                    ): name for path, name in file_paths
                 }
                 
-                start_time = time.time()
-                compressed_path = None
-                target_path = file_path
-                
-                try:
-                    # サイズチェック & 圧縮
-                    file_size = file_path.stat().st_size
-                    if file_size > 25 * 1024 * 1024:
-                        status_text.text(f"圧縮中 ({idx+1}/{total_files}): {file_name} ({file_size/1024/1024:.1f}MB)")
-                        try:
-                            compressed_path = _compress_audio(file_path)
-                            target_path = compressed_path
-                        except Exception as e:
-                            # 圧縮失敗時はそのままトライするかエラーにするか。web_ui同様、失敗扱いにする
-                             raise ValueError(f"25MB超過ファイルの圧縮に失敗しました: {e}")
-
-                    # APIコール
-                    status_text.text(f"API送信中 ({idx+1}/{total_files}): {file_name}")
-                    with open(target_path, "rb") as audio_file:
-                        params = {"model": DEFAULT_MODEL, "file": audio_file}
-                        if language.strip():
-                            params["language"] = language.strip()
-                        
-                        resp = client.audio.transcriptions.create(**params)
+                # 完了したものから順次処理
+                for future in as_completed(future_to_file):
+                    name = future_to_file[future]
+                    try:
+                        res = future.result()
+                        results.append(res)
+                    except Exception as e:
+                        # 万が一の予期せぬエラー
+                        results.append({
+                            "file": name,
+                            "success": False,
+                            "text": "",
+                            "text_masked": "",
+                            "error": f"予期せぬエラー: {str(e)}",
+                            "model": DEFAULT_MODEL,
+                            "process_time_sec": 0
+                        })
                     
-                    raw_text = getattr(resp, "text", "")
-                    masked_text = raw_text
-                    if enable_mask and MASKER_AVAILABLE:
-                        masked_text = mask_text(raw_text, _MASK_TOKENS)
-                    
-                    result_data["success"] = True
-                    result_data["text"] = raw_text
-                    result_data["text_masked"] = masked_text
-                    
-                except Exception as e:
-                    result_data["error"] = str(e)
-                finally:
-                    result_data["process_time_sec"] = time.time() - start_time
-                    if compressed_path and compressed_path.exists():
-                        try:
-                            compressed_path.unlink()
-                        except:
-                            pass
-                
-                results.append(result_data)
-                progress_bar.progress((idx + 1) / total_files)
+                    completed_count += 1
+                    progress = completed_count / total_files
+                    progress_bar.progress(progress)
+                    status_text.text(f"処理中 ({completed_count}/{total_files}): 最新の完了 -> {name}")
         
         status_text.text("完了！")
         
-        # 結果表示
+        # --- 結果表示 ---
         st.divider()
         st.subheader("処理結果")
+        
+        # 名前順にソートして表示
+        results.sort(key=lambda x: x["file"])
         
         # CSV作成
         csv_buffer = io.StringIO()
@@ -213,19 +278,27 @@ if uploaded_files and api_key_input:
             mime="text/csv"
         )
         
+        # 個別結果の表示
         for res in results:
-            with st.expander(f"{res['file']} ({'成功' if res['success'] else '失敗'})"):
+            label = f"{res['file']}"
+            if not res['success']:
+                label += " ❌ (失敗)"
+            else:
+                label += " ✅ (成功)"
+                
+            with st.expander(label):
+                st.write(f"処理時間: {res['process_time_sec']:.2f}秒")
                 if res["success"]:
                     if enable_mask:
-                        st.caption("マスキング済みテキスト")
+                        st.markdown("**マスキング済みテキスト:**")
                         st.write(res["text_masked"])
-                        st.caption("原文")
+                        st.markdown("**原文:**")
                         with st.expander("原文を表示"):
                             st.write(res["text"])
                     else:
                         st.write(res["text"])
                 else:
-                    st.error(f"エラー: {res['error']}")
+                    st.error(f"エラー内容: {res['error']}")
                     
 elif not api_key_input:
     st.info("左のサイドバーでAPI Keyを設定してください。")
