@@ -1,0 +1,7 @@
+openai>=1.101.0
+python-dotenv>=1.1.1
+Flask>=3.0.0
+imageio-ffmpeg>=0.4.9
+
+
+
